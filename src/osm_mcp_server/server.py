@@ -7,7 +7,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import math
 import io
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageDraw
 from datetime import datetime
 
 
@@ -1596,20 +1596,25 @@ async def get_tile_by_radius(
     latitude: float,
     longitude: float,
     radius: float,
-    ctx: Context
+    ctx: Context,
+    markers: Optional[List[Dict[str, Any]]] = None
 ) -> Image:
     """
-    Get a square map image centered at a specific location that covers a given radius.
+    Get a square map image centered at a specific location that covers a given radius,
+    optionally with markers at specified coordinates.
     
-    This tool fetches OpenStreetMap tiles, stitches them together, and crops the result
-     to provide a high-quality map image of the area within the specified radius.
-    The scale of the "tile" is automatically determined based on the radius to 
-    ensure the entire area is visible.
+    This tool fetches OpenStreetMap tiles, stitches them together, crops the result,
+    and can draw markers (dots) at provided locations.
     
     Args:
         latitude: Center point latitude (decimal degrees)
         longitude: Center point longitude (decimal degrees)
         radius: The radius in meters that should be visible in the image
+        markers: Optional list of markers to draw. Each marker is a dict with:
+                - latitude (float)
+                - longitude (float)
+                - color (str, optional, e.g. "red")
+                - label (str, optional - not yet implemented in drawing)
         
     Returns:
         A square PNG image of the requested area.
@@ -1637,10 +1642,11 @@ async def get_tile_by_radius(
     zoom = min(19, max(0, zoom))
     ctx.info(f"Selected zoom level {zoom}")
     
-    # 2. Convert lat/lon to tile coordinates
+    # 2. Convert lat/lon to tile coordinates (Mercator)
     n = 2.0 ** zoom
     x_tile_float = (longitude + 180.0) / 360.0 * n
-    y_tile_float = (1.0 - math.log(math.tan(lat_rad) + (1 / cos_lat)) / math.pi) / 2.0 * n
+    # Standard Web Mercator formula using asinh for stability
+    y_tile_float = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
     
     # Base tile coordinates (top-left of our grid)
     center_x = int(x_tile_float)
@@ -1719,10 +1725,185 @@ async def get_tile_by_radius(
     
     final_img = canvas.crop((int(left), int(top), int(right), int(bottom)))
     
-    # 6. Return as FastMCP Image
+    # 6. Draw markers if provided
+    draw = ImageDraw.Draw(final_img)
+    
+    # Optional: Draw a subtle center crosshair for debugging alignment
+    w, h = final_img.size
+    cross_size = 10
+    draw.line((w//2 - cross_size, h//2, w//2 + cross_size, h//2), fill=(100, 100, 100), width=1)
+    draw.line((w//2, h//2 - cross_size, w//2, h//2 + cross_size), fill=(100, 100, 100), width=1)
+
+    if markers:
+        for marker in markers:
+            m_lat = marker.get("latitude")
+            m_lon = marker.get("longitude")
+            if m_lat is None or m_lon is None:
+                continue
+                
+            # Mercator projection for marker
+            m_lat_rad = math.radians(m_lat)
+            m_x_tile = (m_lon + 180.0) / 360.0 * n
+            m_y_tile = (1.0 - math.asinh(math.tan(m_lat_rad)) / math.pi) / 2.0 * n
+            
+            # Canvas pixels
+            m_px_x = (m_x_tile - start_tx) * 256.0
+            m_px_y = (m_y_tile - start_ty) * 256.0
+            
+            # Final image pixels (relative to crop box)
+            final_x = m_px_x - left
+            final_y = m_px_y - top
+            
+            # Draw a prominent circle for the marker
+            r = 10
+            color = marker.get("color", "red")
+            # Glow -> Border -> Fill
+            draw.ellipse((final_x - (r+3), final_y - (r+3), final_x + (r+3), final_y + (r+3)), fill="white")
+            draw.ellipse((final_x - (r+1), final_y - (r+1), final_x + (r+1), final_y + (r+1)), fill="black")
+            draw.ellipse((final_x - r, final_y - r, final_x + r, final_y + r), fill=color)
+            draw.ellipse((final_x - 1, final_y - 1, final_x + 1, final_y + 1), fill="white")
+    
+    # 7. Return as FastMCP Image
     img_byte_arr = io.BytesIO()
     final_img.save(img_byte_arr, format='PNG')
     
+    return Image(data=img_byte_arr.getvalue(), format="png")
+
+@mcp.tool()
+async def get_tile_by_bbox(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    ctx: Context,
+    markers: Optional[List[Dict[str, Any]]] = None
+) -> Image:
+    """
+    Get a map image covering a specific bounding box, optionally with markers.
+    
+    This tool fetches OpenStreetMap tiles to cover the area defined by the 
+    north, south, east, and west coordinates.
+    
+    Args:
+        north: Northern latitude boundary
+        south: Southern latitude boundary
+        east: Eastern longitude boundary
+        west: Western longitude boundary
+        markers: Optional list of markers to draw. Each marker is a dict with:
+                - latitude (float)
+                - longitude (float)
+                - color (str, optional, e.g. "red")
+        
+    Returns:
+        A PNG image of the requested area.
+    """
+    ctx.info(f"Generating map tile for bbox: N:{north}, S:{south}, E:{east}, W:{west}")
+    
+    # Ensure coordinates are in correct order
+    n, s = max(north, south), min(north, south)
+    e, w = max(east, west), min(east, west)
+    
+    # 1. Determine optimal zoom level to fit the bbox in ~1024px
+    target_px = 1024
+    
+    # Lon zoom
+    lon_diff = e - w
+    if lon_diff <= 0: lon_diff = 0.0001
+    z_lon = math.log2(360.0 * target_px / (lon_diff * 256.0))
+    
+    # Lat zoom
+    def lat_to_y_norm(lat):
+        lat_rad = math.radians(lat)
+        return (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0
+        
+    y_n = lat_to_y_norm(n)
+    y_s = lat_to_y_norm(s)
+    y_diff = abs(y_s - y_n)
+    if y_diff <= 0: y_diff = 0.0001
+    z_lat = math.log2(target_px / (y_diff * 256.0))
+    
+    zoom = min(19, max(0, int(math.floor(min(z_lon, z_lat)))))
+    ctx.info(f"Selected zoom level {zoom}")
+    
+    # 2. Convert boundaries to tile coordinates
+    scale = 2.0 ** zoom
+    tx_min = w + 180.0
+    tx_max = e + 180.0
+    
+    x_tile_min = tx_min / 360.0 * scale
+    x_tile_max = tx_max / 360.0 * scale
+    y_tile_min = lat_to_y_norm(n) * scale
+    y_tile_max = lat_to_y_norm(s) * scale
+    
+    # 3. Fetch tiles
+    tiles_data = {}
+    async with aiohttp.ClientSession(headers={"User-Agent": "OSM-MCP-Server/1.0"}) as session:
+        min_tx, max_tx = int(math.floor(x_tile_min)), int(math.floor(x_tile_max))
+        min_ty, max_ty = int(math.floor(y_tile_min)), int(math.floor(y_tile_max))
+        
+        async def fetch_tile(tx, ty):
+            url = f"https://tile.openstreetmap.org/{zoom}/{tx}/{ty}.png"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        tiles_data[(tx, ty)] = await resp.read()
+            except Exception as e:
+                ctx.warning(f"Failed to fetch tile {tx},{ty}: {e}")
+
+        # Limit safety - don't fetch more than 50 tiles
+        if (max_tx - min_tx + 1) * (max_ty - min_ty + 1) > 50:
+             raise Exception("Bounding box is too large for the current zoom level. Please specify a smaller area.")
+
+        fetch_tasks = [fetch_tile(tx, ty) for tx in range(min_tx, max_tx + 1) for ty in range(min_ty, max_ty + 1)]
+        if fetch_tasks:
+            await asyncio.gather(*fetch_tasks)
+
+    if not tiles_data:
+        raise Exception("Could not fetch any map tiles")
+        
+    # 4. Stitch tiles
+    all_tx, all_ty = [k[0] for k in tiles_data.keys()], [k[1] for k in tiles_data.keys()]
+    start_tx, start_ty = min(all_tx), min(all_ty)
+    
+    canvas_w = (max(all_tx) - start_tx + 1) * 256
+    canvas_h = (max(all_ty) - start_ty + 1) * 256
+    canvas = PILImage.new('RGB', (canvas_w, canvas_h))
+    
+    for (tx, ty), data in tiles_data.items():
+        canvas.paste(PILImage.open(io.BytesIO(data)), ((tx - start_tx) * 256, (ty - start_ty) * 256))
+        
+    # 5. Crop to exact bbox
+    left = (x_tile_min - start_tx) * 256
+    top = (y_tile_min - start_ty) * 256
+    right = (x_tile_max - start_tx) * 256
+    bottom = (y_tile_max - start_ty) * 256
+    
+    final_img = canvas.crop((int(left), int(top), int(right), int(bottom)))
+    
+    # 6. Draw markers
+    draw = ImageDraw.Draw(final_img)
+    if markers:
+        for marker in markers:
+            m_lat, m_lon = marker.get("latitude"), marker.get("longitude")
+            if m_lat is None or m_lon is None: continue
+            
+            # Project marker
+            mx = (m_lon + 180.0) / 360.0 * scale
+            my = lat_to_y_norm(m_lat) * scale
+            
+            # Final px
+            fx = (mx - start_tx) * 256 - left
+            fy = (my - start_ty) * 256 - top
+            
+            r = 10
+            color = marker.get("color", "red")
+            draw.ellipse((fx - (r+3), fy - (r+3), fx + (r+3), fy + (r+3)), fill="white")
+            draw.ellipse((fx - (r+1), fy - (r+1), fx + (r+1), fy + (r+1)), fill="black")
+            draw.ellipse((fx - r, fy - r, fx + r, fy + r), fill=color)
+            draw.ellipse((fx - 1, fy - 1, fx + 1, fy + 1), fill="white")
+            
+    img_byte_arr = io.BytesIO()
+    final_img.save(img_byte_arr, format='PNG')
     return Image(data=img_byte_arr.getvalue(), format="png")
 
 if __name__ == "__main__":
