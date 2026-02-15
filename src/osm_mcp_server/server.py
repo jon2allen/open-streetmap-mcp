@@ -1,4 +1,4 @@
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
 from dataclasses import dataclass
 from typing import AsyncIterator, List, Dict, Optional, Tuple, Any, Union
 import aiohttp
@@ -6,6 +6,8 @@ import json
 import asyncio
 from contextlib import asynccontextmanager
 import math
+import io
+from PIL import Image as PILImage
 from datetime import datetime
 
 
@@ -1588,6 +1590,140 @@ async def find_parking_facilities(
         "parking_facilities": results,
         "count": len(results)
     }
+
+@mcp.tool()
+async def get_tile_by_radius(
+    latitude: float,
+    longitude: float,
+    radius: float,
+    ctx: Context
+) -> Image:
+    """
+    Get a square map image centered at a specific location that covers a given radius.
+    
+    This tool fetches OpenStreetMap tiles, stitches them together, and crops the result
+     to provide a high-quality map image of the area within the specified radius.
+    The scale of the "tile" is automatically determined based on the radius to 
+    ensure the entire area is visible.
+    
+    Args:
+        latitude: Center point latitude (decimal degrees)
+        longitude: Center point longitude (decimal degrees)
+        radius: The radius in meters that should be visible in the image
+        
+    Returns:
+        A square PNG image of the requested area.
+    """
+    ctx.info(f"Generating map tile for ({latitude}, {longitude}) with radius {radius}m")
+    
+    # 1. Determine optimal zoom level
+    # For OSM, resolution (meters/pixel) = 156543.03392 * cos(lat) / 2^zoom
+    # We want 2 * radius to fit in a reasonable image size (e.g., 512x512 pixels)
+    # result_pixel_size = 512
+    # resolution = (2 * radius) / result_pixel_size = radius / 256
+    # 2^zoom = 156543.03392 * cos(lat) / (radius / 256)
+    # zoom = log2(156543.03392 * cos(lat) * 256 / radius)
+    
+    lat_rad = math.radians(latitude)
+    cos_lat = math.cos(lat_rad)
+    
+    # Calculate float zoom
+    try:
+        z_float = math.log2(156543.03392 * cos_lat * 256 / radius)
+        zoom = int(round(z_float))
+    except (ValueError, ZeroDivisionError):
+        zoom = 15
+        
+    zoom = min(19, max(0, zoom))
+    ctx.info(f"Selected zoom level {zoom}")
+    
+    # 2. Convert lat/lon to tile coordinates
+    n = 2.0 ** zoom
+    x_tile_float = (longitude + 180.0) / 360.0 * n
+    y_tile_float = (1.0 - math.log(math.tan(lat_rad) + (1 / cos_lat)) / math.pi) / 2.0 * n
+    
+    # Base tile coordinates (top-left of our grid)
+    center_x = int(x_tile_float)
+    center_y = int(y_tile_float)
+    
+    # 3. Fetch a grid of tiles (3x3 to be sure we cover the area)
+    # We use a grid because the area might span across multiple tiles
+    tiles_data = {}
+    
+    async with aiohttp.ClientSession(headers={"User-Agent": "OSM-MCP-Server/1.0"}) as session:
+        fetch_tasks = []
+        
+        async def fetch_tile(tx, ty):
+            url = f"https://tile.openstreetmap.org/{zoom}/{tx}/{ty}.png"
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        tiles_data[(tx, ty)] = await resp.read()
+            except Exception as e:
+                ctx.warning(f"Failed to fetch tile {tx},{ty}: {e}")
+
+        # Determine range of tiles needed
+        # resolution at this zoom
+        res = 156543.03392 * cos_lat / (2**zoom)
+        pixel_radius = radius / res
+        
+        # We need a box of 2*pixel_radius
+        # Convert pixel_radius to tile space (1 tile = 256 pixels)
+        tile_radius = pixel_radius / 256.0
+        
+        min_tx = int(x_tile_float - tile_radius)
+        max_tx = int(x_tile_float + tile_radius)
+        min_ty = int(y_tile_float - tile_radius)
+        max_ty = int(y_tile_float + tile_radius)
+        
+        for tx in range(min_tx, max_tx + 1):
+            for ty in range(min_ty, max_ty + 1):
+                fetch_tasks.append(fetch_tile(tx, ty))
+        
+        if fetch_tasks:
+            await asyncio.gather(*fetch_tasks)
+
+    if not tiles_data:
+        raise Exception("Could not fetch any map tiles")
+        
+    # 4. Stitch tiles
+    # Determine the bounds of our stitched image in tile coordinates
+    all_tx = [k[0] for k in tiles_data.keys()]
+    all_ty = [k[1] for k in tiles_data.keys()]
+    
+    start_tx, end_tx = min(all_tx), max(all_tx)
+    start_ty, end_ty = min(all_ty), max(all_ty)
+    
+    grid_width = (end_tx - start_tx + 1) * 256
+    grid_height = (end_ty - start_ty + 1) * 256
+    
+    canvas = PILImage.new('RGB', (grid_width, grid_height))
+    
+    for (tx, ty), data in tiles_data.items():
+        tile_img = PILImage.open(io.BytesIO(data))
+        canvas.paste(tile_img, ((tx - start_tx) * 256, (ty - start_ty) * 256))
+        
+    # 5. Crop to the requested center and radius
+    # Center position on the canvas in pixels
+    center_px_x = (x_tile_float - start_tx) * 256
+    center_px_y = (y_tile_float - start_ty) * 256
+    
+    # Real resolution might be slightly different from our target due to integer zoom
+    res = 156543.03392 * cos_lat / (2**zoom)
+    pixel_radius = radius / res
+    
+    left = center_px_x - pixel_radius
+    top = center_px_y - pixel_radius
+    right = center_px_x + pixel_radius
+    bottom = center_px_y + pixel_radius
+    
+    final_img = canvas.crop((int(left), int(top), int(right), int(bottom)))
+    
+    # 6. Return as FastMCP Image
+    img_byte_arr = io.BytesIO()
+    final_img.save(img_byte_arr, format='PNG')
+    
+    return Image(data=img_byte_arr.getvalue(), format="png")
 
 if __name__ == "__main__":
     mcp.run()
