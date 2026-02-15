@@ -6,7 +6,7 @@ import json
 async def main():
     # Configure connection to the OSM MCP server
     server_params = StdioServerParameters(
-        command="osm-mcp-server",
+        command="../.venv/bin/osm-mcp-server",
         args=[],
         env=None
     )

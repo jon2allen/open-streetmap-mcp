@@ -151,22 +151,16 @@ class OSMClient:
         
         overpass_url = "https://overpass-api.de/api/interpreter"
         
-        # Build query for specified category and subcategories
-        if subcategories:
-            subcategory_filters = " or ".join([f'"{category}"="{sub}"' for sub in subcategories])
-            query_filter = f'({subcategory_filters})'
-        else:
-            query_filter = f'"{category}"'
+        min_lon, min_lat, max_lon, max_lat = bbox
+        bbox_str = f"{min_lat},{min_lon},{max_lat},{max_lon}"
         
-        query = f"""
-        [out:json];
-        (
-          node[{query_filter}]({bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]});
-          way[{query_filter}]({bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]});
-          relation[{query_filter}]({bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]});
-        );
-        out body;
-        """
+        if subcategories:
+            regex_values = "|".join(subcategories)
+            filter_str = f'["{category}"~"{regex_values}"]'
+        else:
+            filter_str = f'["{category}"]'
+        
+        query = f"[out:json]; (node{filter_str}({bbox_str}); way{filter_str}({bbox_str}); relation{filter_str}({bbox_str});); out body;"
         
         async with self.session.post(overpass_url, data={"data": query}) as response:
             if response.status == 200:
